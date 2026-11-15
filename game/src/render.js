@@ -7,19 +7,39 @@
 //
 // Component vocabulary (one name each, reused on every screen): Wordmark,
 // HudBar, IconButton, Banner, Panel, Reticle, Floater, Telegraph, Wisp,
-// Ember, PickupGlyph. One screen carries one idea; one panel carries one
-// primary action.
+// Ember, PickupGlyph, Thumbstick, Ghost, Arc, Lance, GoalsRow. One screen
+// carries one idea; one panel carries one primary action.
 
 import {
-  BUTTONS, COMBO_WINDOW, FIELD, MAX_LIVES, PALETTE, PLAYER, SPAWN_TELEGRAPH,
-  TOTAL_WAVES, comboMultiplier,
+  BUTTONS, COMBO_WINDOW, FIELD, MAX_LIVES, PALETTE, PICKUPS, PLAYER,
+  SPAWN_TELEGRAPH, TOTAL_WAVES, comboMultiplier,
 } from './config.js';
+import { BADGES } from './challenges.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
 export const SCREEN_PAUSED = 'paused';
 export const SCREEN_OVER = 'over';
 export const SCREEN_WON = 'won';
+
+// Easing for every UI transition (exported so the harness can prove the
+// curves are smooth rather than stepped): easeOutCubic is the default
+// settle, easeOutBack is the panel pop.
+export function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+export function easeOutCubic(t) {
+  const u = 1 - clamp01(t);
+  return 1 - u * u * u;
+}
+
+export function easeOutBack(t) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  const u = clamp01(t) - 1;
+  return 1 + c3 * u * u * u + c1 * u * u;
+}
 
 const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
 
@@ -78,6 +98,21 @@ export function createRenderer(canvas) {
     return { x: (x - offsetX) / scale, y: (y - offsetY) / scale };
   }
 
+  // Staggered entrances, driven by seconds since the screen appeared.
+  // Staged frames and callers without a clock render the rested state,
+  // so a screenshot is always the finished layout, never mid-slide.
+  function entrance(ui, delay, duration) {
+    if (ui.instant || ui.uiTime === undefined) return { alpha: 1, dy: 0 };
+    const eased = easeOutCubic((ui.uiTime - delay) / duration);
+    return { alpha: eased, dy: (1 - eased) * 16 };
+  }
+
+  function panelPop(ui, duration = 0.28) {
+    if (ui.instant || ui.uiTime === undefined) return { scale: 1, alpha: 1 };
+    const p = clamp01(ui.uiTime / duration);
+    return { scale: 0.92 + 0.08 * easeOutBack(p), alpha: easeOutCubic(p) };
+  }
+
   function drawBackground(state) {
     const gradient = ctx.createRadialGradient(
       FIELD.width / 2, FIELD.height / 2, 80,
@@ -107,7 +142,14 @@ export function createRenderer(canvas) {
       ctx.globalAlpha = alpha;
       ctx.fillStyle = PALETTE.star;
       ctx.beginPath();
-      ctx.arc(star.x, star.y, star.size, 0, Math.PI * 2);
+      // Parallax: far stars barely move with the wisp, near stars drift
+      // more, so the field has depth. Positions wrap, so no star is lost.
+      const depth = star.depth ?? 1;
+      const px = (state.player.x - FIELD.width / 2) * 0.03 * depth;
+      const py = (state.player.y - FIELD.height / 2) * 0.03 * depth;
+      const x = ((star.x - px) % FIELD.width + FIELD.width) % FIELD.width;
+      const y = ((star.y - py) % FIELD.height + FIELD.height) % FIELD.height;
+      ctx.arc(x, y, star.size, 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.globalAlpha = 1;
@@ -116,7 +158,10 @@ export function createRenderer(canvas) {
       ctx.globalAlpha = 0.45;
       ctx.fillStyle = PALETTE.mote;
       ctx.beginPath();
-      ctx.arc(mote.x, mote.y, mote.size, 0, Math.PI * 2);
+      const depth = mote.depth ?? 1;
+      const px = (state.player.x - FIELD.width / 2) * 0.05 * depth;
+      const py = (state.player.y - FIELD.height / 2) * 0.05 * depth;
+      ctx.arc(mote.x - px, mote.y - py, mote.size, 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.globalAlpha = 1;
@@ -130,7 +175,7 @@ export function createRenderer(canvas) {
   }
 
   function drawWisp(x, y, radius, time, angle) {
-    const flicker = 1 + Math.sin(time * 14) * 0.08;
+    const flicker = (1 + Math.sin(time * 14) * 0.08) * (1 + Math.sin(time * 3) * 0.05);
     ctx.save();
     ctx.translate(x, y);
     ctx.shadowBlur = 26;
@@ -179,7 +224,7 @@ export function createRenderer(canvas) {
       }
       ctx.restore();
     }
-    drawWisp(player.x, player.y, PLAYER.radius, state.time, player.angle);
+    drawWisp(player.x, player.y, PLAYER.radius * (player.muzzle > 0 ? 1.12 : 1), state.time, player.angle);
     // Muzzle flash: a brief star at the gun tip when a shot leaves.
     if (player.muzzle > 0) {
       const tipX = player.x + Math.cos(player.angle) * (PLAYER.radius + 8);
@@ -229,6 +274,10 @@ export function createRenderer(canvas) {
     }
     ctx.save();
     ctx.translate(enemy.x, enemy.y);
+    // Squash: a fresh hit compresses the body for a few frames, so the
+    // impact reads as weight, not just a colour blink.
+    const hit = enemy.flash > 0 ? enemy.flash / 0.07 : 0;
+    if (hit > 0) ctx.scale(1 + hit * 0.18, 1 - hit * 0.12);
     if (enemy.kind === 'drifter') {
       ctx.shadowBlur = 18;
       ctx.shadowColor = PALETTE.ember;
@@ -308,6 +357,13 @@ export function createRenderer(canvas) {
       ctx.translate(pickup.x, y);
       ctx.scale(pulse, pulse);
       ctx.shadowBlur = 14;
+      // A breathing halo behind the glyph: pickups glow before they are read.
+      ctx.globalAlpha = 0.16 + 0.05 * Math.sin(pickup.bob * 1.7);
+      ctx.fillStyle = PICKUPS[pickup.kind].colour;
+      ctx.beginPath();
+      ctx.arc(0, 0, 26, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
       if (pickup.kind === 'heart') {
         ctx.shadowColor = PALETTE.danger;
         ctx.fillStyle = PALETTE.danger;
@@ -350,11 +406,70 @@ export function createRenderer(canvas) {
       // push its score callout half off the screen.
       const half = ctx.measureText(floater.text).width / 2 + 6;
       const x = Math.max(half, Math.min(FIELD.width - half, floater.x));
-      ctx.strokeText(floater.text, x, floater.y);
+      // Pop: the callout overshoots its size for a blink at birth.
+      const age = floater.age ?? floater.maxLife;
+      const pop = age < 0.18 ? 1 + 0.3 * (1 - age / 0.18) : 1;
+      ctx.save();
+      ctx.translate(x, floater.y);
+      ctx.scale(pop, pop);
+      ctx.strokeText(floater.text, 0, 0);
       ctx.fillStyle = floater.colour;
-      ctx.fillText(floater.text, x, floater.y);
+      ctx.fillText(floater.text, 0, 0);
+      ctx.restore();
     }
     ctx.restore();
+  }
+
+  function drawGhosts(state) {
+    for (const ghost of state.ghosts) {
+      const progress = 1 - ghost.life / ghost.maxLife;
+      const alpha = (ghost.life / ghost.maxLife) * 0.7;
+      const colour = ENEMY_FILL[ghost.kind];
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = colour;
+      ctx.beginPath();
+      ctx.arc(ghost.x, ghost.y, ghost.radius * (1 + progress * 0.5), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = alpha * 0.7;
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(ghost.x, ghost.y, ghost.radius * (1.2 + progress * 0.9), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawArcs(state) {
+    for (const arc of state.arcs) {
+      const flicker = 0.7 + 0.3 * Math.sin(state.time * 80 + arc.phase);
+      const alpha = Math.max(0, arc.life / arc.maxLife) * flicker;
+      const trace = () => {
+        ctx.beginPath();
+        ctx.moveTo(arc.points[0].x, arc.points[0].y);
+        for (let i = 1; i < arc.points.length; i += 1) ctx.lineTo(arc.points[i].x, arc.points[i].y);
+        ctx.stroke();
+      };
+      ctx.save();
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.globalAlpha = alpha * 0.35;
+      ctx.strokeStyle = arc.colour;
+      ctx.lineWidth = 6;
+      trace();
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 2;
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = arc.colour;
+      trace();
+      ctx.globalAlpha = alpha * 0.9;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1;
+      ctx.shadowBlur = 0;
+      trace();
+      ctx.restore();
+    }
   }
 
   function drawHudScrim() {
@@ -537,14 +652,41 @@ export function createRenderer(canvas) {
     ctx.restore();
   }
 
+  function drawThumbstick(stick) {
+    if (!stick) return;
+    // The floating stick: a quiet ring where the thumb landed, and a
+    // bright knob where it is pushing. It only ever exists while a thumb
+    // is down, so the desktop frame never sees it.
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = 'rgba(10, 14, 34, 0.45)';
+    ctx.strokeStyle = PALETTE.panelEdge;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(stick.baseX, stick.baseY, stick.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = PALETTE.emberCore;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = PALETTE.ember;
+    ctx.beginPath();
+    ctx.arc(stick.thumbX, stick.thumbY, stick.radius * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
   function drawBanner(state) {
     if (!state.banner || state.banner.timer <= 0) return;
     const age = state.banner.duration - state.banner.timer;
     const punch = age < 0.25 ? 1.18 - 0.18 * (age / 0.25) : 1;
-    const alpha = Math.min(1, age * 6, state.banner.timer * 1.5);
+    // Entrance: the banner slides down and fades in over its first
+    // third of a second instead of appearing all at once.
+    const enter = easeOutCubic(age / 0.3);
+    const alpha = enter * Math.min(1, state.banner.timer * 1.5);
     ctx.save();
     ctx.globalAlpha = Math.max(0, alpha);
-    ctx.translate(FIELD.width / 2, 118);
+    ctx.translate(FIELD.width / 2, 118 - (1 - enter) * 18);
     ctx.scale(punch, punch);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -616,7 +758,41 @@ export function createRenderer(canvas) {
     ctx.restore();
   }
 
-  function drawTitle(state, best) {
+  function drawGoalsRow(cx, y, earned, numbers) {
+    // One short line: the three goals, a gold star for each one earned.
+    // On the end screen, numbers from the run just played ride along.
+    ctx.save();
+    ctx.font = `700 15px ${FONT}`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    const parts = [{ text: 'GOALS', colour: PALETTE.dimText }];
+    BADGES.forEach((badge, index) => {
+      if (index > 0) parts.push({ text: '·', colour: PALETTE.dimText });
+      const owned = earned.includes(badge.id);
+      let text = `${owned ? '★' : '☆'} ${badge.label}`;
+      if (numbers) {
+        if (badge.id === 'combo12') text += ` (BEST ×${numbers.maxCombo})`;
+        else if (badge.id === 'wave10') text += ` (WAVE ${numbers.maxWave})`;
+        else if (badge.id === 'flawless') {
+          const hits = (numbers.hitsTaken ?? 0) + (numbers.blocksTaken ?? 0);
+          text += hits === 0 ? ' (NO HITS)' : ` (${hits} HIT${hits === 1 ? '' : 'S'})`;
+        }
+      }
+      parts.push({ text, colour: owned ? PALETTE.gold : PALETTE.dimText });
+    });
+    const gap = 10;
+    const widths = parts.map((part) => ctx.measureText(part.text).width);
+    const total = widths.reduce((sum, width) => sum + width, 0) + gap * (parts.length - 1);
+    let x = cx - total / 2;
+    parts.forEach((part, index) => {
+      ctx.fillStyle = part.colour;
+      ctx.fillText(part.text, x, y);
+      x += widths[index] + gap;
+    });
+    ctx.restore();
+  }
+
+  function drawTitle(state, best, touchMode, ui) {
     // A scrim keeps the wandering attract-mode embers from colliding
     // with the wordmark: the title owns the centre of the screen.
     ctx.fillStyle = 'rgba(4, 6, 16, 0.42)';
@@ -625,56 +801,85 @@ export function createRenderer(canvas) {
     // the wordmark sit on it, and no wandering ember shows through the text.
     ctx.fillStyle = 'rgba(4, 6, 16, 0.45)';
     ctx.beginPath();
-    ctx.roundRect(290, 64, 700, 508, 28);
+    ctx.roundRect(290, 64, 700, 556, 28);
     ctx.fill();
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    drawWisp(FIELD.width / 2, 108, 26, state.time, -Math.PI / 2);
-    const glow = 0.7 + 0.3 * Math.sin(state.time * 2.2);
-    ctx.globalAlpha = glow;
-    ctx.fillStyle = PALETTE.ember;
-    ctx.font = `900 76px ${FONT}`;
-    ctx.shadowBlur = 34;
-    ctx.shadowColor = PALETTE.ember;
-    try { ctx.letterSpacing = '4px'; } catch { /* older canvas: no tracking */ }
-    ctx.fillText('EMBERFALL', FIELD.width / 2, 210);
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = PALETTE.frost;
-    ctx.fillText('ARENA', FIELD.width / 2, 286);
-    try { ctx.letterSpacing = '0px'; } catch { /* older canvas */ }
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = `600 20px ${FONT}`;
-    ctx.fillText('Survive 10 waves. Chain kills. Beat your best.', FIELD.width / 2, 340);
-    const labels = ['WASD · MOVE', 'MOUSE · AIM', 'HOLD CLICK · FIRE'];
-    const gap = 16;
-    const widths = labels.map((label) => {
-      ctx.font = `700 15px ${FONT}`;
-      return ctx.measureText(label).width + 30;
+    // Staggered entrance: wordmark, premise, chips, button, then the
+    // goals row — each slides up and fades in a beat after the last.
+    const place = (delay, fn) => {
+      const e = entrance(ui, delay, 0.4);
+      ctx.save();
+      ctx.globalAlpha = e.alpha;
+      ctx.translate(0, e.dy);
+      fn(e);
+      ctx.restore();
+    };
+    place(0, (e) => {
+      drawWisp(FIELD.width / 2, 108, 26, state.time, -Math.PI / 2);
+      const glow = 0.7 + 0.3 * Math.sin(state.time * 2.2);
+      ctx.globalAlpha = e.alpha * glow;
+      ctx.fillStyle = PALETTE.ember;
+      ctx.font = `900 76px ${FONT}`;
+      ctx.shadowBlur = 34;
+      ctx.shadowColor = PALETTE.ember;
+      try { ctx.letterSpacing = '4px'; } catch { /* older canvas: no tracking */ }
+      ctx.fillText('EMBERFALL', FIELD.width / 2, 210);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = PALETTE.frost;
+      ctx.fillText('ARENA', FIELD.width / 2, 286);
+      try { ctx.letterSpacing = '0px'; } catch { /* older canvas */ }
     });
-    const total = widths.reduce((sum, width) => sum + width, 0) + gap * (labels.length - 1);
-    let cx = FIELD.width / 2 - total / 2;
-    labels.forEach((label, index) => {
-      drawChip(cx + widths[index] / 2, 386, label);
-      cx += widths[index] + gap;
+    place(0.12, () => {
+      ctx.fillStyle = PALETTE.text;
+      ctx.font = `600 20px ${FONT}`;
+      ctx.fillText('Survive 10 waves. Chain kills. Beat your best.', FIELD.width / 2, 340);
     });
-    drawPrimaryButton(FIELD.width / 2, 462, 'PLAY');
-    ctx.fillStyle = PALETTE.dimText;
-    ctx.font = `600 15px ${FONT}`;
-    ctx.fillText('or press Space', FIELD.width / 2, 516);
-    if (best > 0) {
-      ctx.fillStyle = PALETTE.gold;
-      ctx.font = `700 17px ${FONT}`;
-      ctx.fillText(`BEST ${best.toLocaleString('en-US')}`, FIELD.width / 2, 550);
-    }
+    place(0.22, () => {
+      const labels = touchMode
+        ? ['LEFT THUMB · MOVE', 'RIGHT THUMB · AIM + FIRE']
+        : ['WASD · MOVE', 'MOUSE · AIM', 'HOLD CLICK · FIRE'];
+      const gap = 16;
+      const widths = labels.map((label) => {
+        ctx.font = `700 15px ${FONT}`;
+        return ctx.measureText(label).width + 30;
+      });
+      const total = widths.reduce((sum, width) => sum + width, 0) + gap * (labels.length - 1);
+      let cx = FIELD.width / 2 - total / 2;
+      labels.forEach((label, index) => {
+        drawChip(cx + widths[index] / 2, 386, label);
+        cx += widths[index] + gap;
+      });
+    });
+    place(0.32, () => {
+      drawPrimaryButton(FIELD.width / 2, 462, 'PLAY');
+    });
+    place(0.4, () => {
+      ctx.fillStyle = PALETTE.dimText;
+      ctx.font = `600 15px ${FONT}`;
+      ctx.fillText(touchMode ? 'or tap PLAY' : 'or press Space', FIELD.width / 2, 516);
+      if (best > 0) {
+        ctx.fillStyle = PALETTE.gold;
+        ctx.font = `700 17px ${FONT}`;
+        ctx.fillText(`BEST ${best.toLocaleString('en-US')}`, FIELD.width / 2, 550);
+      }
+    });
+    place(0.48, () => {
+      drawGoalsRow(FIELD.width / 2, 592, ui.badges ?? [], null);
+    });
     ctx.restore();
   }
 
-  function drawPaused(state) {
+  function drawPaused(state, touchMode, ui) {
     ctx.save();
     ctx.fillStyle = 'rgba(4, 6, 16, 0.62)';
     ctx.fillRect(0, 0, FIELD.width, FIELD.height);
+    const pop = panelPop(ui);
+    ctx.globalAlpha = pop.alpha;
+    ctx.translate(FIELD.width / 2, FIELD.height / 2);
+    ctx.scale(pop.scale, pop.scale);
+    ctx.translate(-FIELD.width / 2, -FIELD.height / 2);
     panel(FIELD.width / 2 - 260, FIELD.height / 2 - 120, 520, 240);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -686,18 +891,25 @@ export function createRenderer(canvas) {
     ctx.fillText(`Score ${state.score.toLocaleString('en-US')}  ·  Wave ${state.wave} of ${TOTAL_WAVES}`, FIELD.width / 2, FIELD.height / 2 - 6);
     ctx.fillStyle = PALETTE.text;
     ctx.font = `700 19px ${FONT}`;
-    ctx.fillText('P or click to keep playing', FIELD.width / 2, FIELD.height / 2 + 38);
-    ctx.fillStyle = PALETTE.dimText;
-    ctx.font = `600 16px ${FONT}`;
-    ctx.fillText('R restarts the run  ·  M mutes', FIELD.width / 2, FIELD.height / 2 + 70);
+    ctx.fillText(touchMode ? 'Tap to keep playing' : 'P or click to keep playing', FIELD.width / 2, FIELD.height / 2 + 38);
+    if (!touchMode) {
+      ctx.fillStyle = PALETTE.dimText;
+      ctx.font = `600 16px ${FONT}`;
+      ctx.fillText('R restarts the run  ·  M mutes', FIELD.width / 2, FIELD.height / 2 + 70);
+    }
     ctx.restore();
   }
 
-  function drawEnd(state, best, won, newBest) {
+  function drawEnd(state, best, won, newBest, ui) {
     ctx.save();
     ctx.fillStyle = 'rgba(4, 6, 16, 0.6)';
     ctx.fillRect(0, 0, FIELD.width, FIELD.height);
-    panel(FIELD.width / 2 - 330, FIELD.height / 2 - 180, 660, 360);
+    const pop = panelPop(ui);
+    ctx.globalAlpha = pop.alpha;
+    ctx.translate(FIELD.width / 2, FIELD.height / 2);
+    ctx.scale(pop.scale, pop.scale);
+    ctx.translate(-FIELD.width / 2, -FIELD.height / 2);
+    panel(FIELD.width / 2 - 330, FIELD.height / 2 - 200, 660, 400);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = won ? PALETTE.gold : PALETTE.danger;
@@ -741,16 +953,29 @@ export function createRenderer(canvas) {
       const col = index % 3;
       const row = Math.floor(index / 3);
       const x = startX + col * cellWidth + cellWidth / 2;
-      const y = FIELD.height / 2 + 44 + row * 30;
+      const y = FIELD.height / 2 + 36 + row * 26;
+      const e = entrance(ui, 0.15 + row * 0.07, 0.3);
+      ctx.save();
+      ctx.globalAlpha *= e.alpha;
       ctx.fillStyle = PALETTE.dimText;
       ctx.textAlign = 'right';
       ctx.fillText(label, x - 8, y);
       ctx.fillStyle = PALETTE.text;
       ctx.textAlign = 'left';
       ctx.fillText(value, x + 8, y);
+      ctx.restore();
     });
     ctx.textAlign = 'center';
-    drawPrimaryButton(FIELD.width / 2, FIELD.height / 2 + 138, 'PLAY AGAIN');
+    const newBadges = ui.newBadges ?? [];
+    const goalsY = FIELD.height / 2 + (newBadges.length > 0 ? 86 : 100);
+    drawGoalsRow(FIELD.width / 2, goalsY, ui.badges ?? [], state);
+    if (newBadges.length > 0) {
+      const names = newBadges.map((id) => BADGES.find((badge) => badge.id === id)?.label ?? id);
+      ctx.fillStyle = PALETTE.gold;
+      ctx.font = `800 16px ${FONT}`;
+      ctx.fillText(`★ NEW BADGE: ${names.join(' · ')}`, FIELD.width / 2, FIELD.height / 2 + 110);
+    }
+    drawPrimaryButton(FIELD.width / 2, FIELD.height / 2 + 154, 'PLAY AGAIN');
     ctx.restore();
   }
 
@@ -760,7 +985,8 @@ export function createRenderer(canvas) {
   return {
     resize,
     toLogical,
-    draw(state, screen, best, muted, mouse = null, newBest = false) {
+    draw(state, screen, best, muted, mouse = null, newBest = false, ui = {}) {
+      const touchMode = Boolean(ui.touchDetected);
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.fillStyle = PALETTE.background;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -770,20 +996,31 @@ export function createRenderer(canvas) {
         ctx.translate((Math.random() - 0.5) * magnitude, (Math.random() - 0.5) * magnitude);
       }
       drawBackground(state);
-      // Player bullets with short light trails.
+      // Player lances: an energy lance, not a dot — a bright head, a
+      // white-hot core and a comet tail along its flight. The hitbox is
+      // unchanged; only the light got better.
       for (const bullet of state.bullets) {
+        const angle = Math.atan2(bullet.vy, bullet.vx);
         ctx.save();
-        ctx.strokeStyle = 'rgba(255, 209, 102, 0.45)';
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.moveTo(bullet.x, bullet.y);
-        ctx.lineTo(bullet.x - bullet.vx * 0.03, bullet.y - bullet.vy * 0.03);
-        ctx.stroke();
+        ctx.translate(bullet.x, bullet.y);
+        ctx.rotate(angle);
         ctx.shadowBlur = 14;
         ctx.shadowColor = PALETTE.emberCore;
-        ctx.fillStyle = PALETTE.emberCore;
+        const tail = ctx.createLinearGradient(-24, 0, 8, 0);
+        tail.addColorStop(0, 'rgba(255, 209, 102, 0)');
+        tail.addColorStop(0.7, 'rgba(255, 209, 102, 0.55)');
+        tail.addColorStop(1, PALETTE.emberCore);
+        ctx.fillStyle = tail;
         ctx.beginPath();
-        ctx.arc(bullet.x, bullet.y, bullet.radius, 0, Math.PI * 2);
+        ctx.roundRect(-24, -3.5, 32, 7, 3.5);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#fff7cc';
+        ctx.beginPath();
+        ctx.roundRect(-8, -1.5, 16, 3, 1.5);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(4, 0, 3.5, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
       }
@@ -805,6 +1042,8 @@ export function createRenderer(canvas) {
       }
       drawPickups(state);
       for (const enemy of state.enemies) drawEnemy(enemy, state.time);
+      drawGhosts(state);
+      drawArcs(state);
       if (screen !== SCREEN_OVER) drawPlayer(state);
       for (const particle of state.particles) {
         ctx.globalAlpha = Math.max(0, particle.life / particle.maxLife);
@@ -816,17 +1055,19 @@ export function createRenderer(canvas) {
       ctx.globalAlpha = 1;
       drawFloaters(state);
       if (screen === SCREEN_TITLE) {
-        drawTitle(state, best);
+        drawTitle(state, best, touchMode, ui);
         drawButtons(screen, muted);
       } else {
         drawHudScrim();
         drawHud(state, best);
         drawBanner(state);
         drawButtons(screen, muted);
-        if (screen === SCREEN_PLAY) drawReticle(mouse, state);
-        else if (screen === SCREEN_PAUSED) drawPaused(state);
-        else if (screen === SCREEN_OVER) drawEnd(state, best, false, newBest);
-        else if (screen === SCREEN_WON) drawEnd(state, best, true, newBest);
+        if (screen === SCREEN_PLAY) {
+          drawReticle(mouse, state);
+          drawThumbstick(ui.touch ? ui.touch.stick : null);
+        } else if (screen === SCREEN_PAUSED) drawPaused(state, touchMode, ui);
+        else if (screen === SCREEN_OVER) drawEnd(state, best, false, newBest, ui);
+        else if (screen === SCREEN_WON) drawEnd(state, best, true, newBest, ui);
       }
     },
   };

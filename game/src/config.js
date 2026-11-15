@@ -33,6 +33,30 @@ export const RECOVERY_SCORE = 500;
 // Hit-stop on a kill only, kept short: weight without sluggishness.
 export const HIT_STOP_KILL = 0.045;
 
+// Surge waves: one wave per run, picked from the run's own seed, arrives
+// heavier and faster, announced by its banner. Never wave 1, 2 or the
+// finale, so the lesson waves and the last stand stay as designed.
+export const SURGE_MIN_WAVE = 3;
+export const SURGE_MAX_WAVE = 8;
+export const SURGE_EXTRA_FRACTION = 0.5;
+export const SURGE_PACE_FACTOR = 0.75;
+
+// Lightning arcs: the payoff for a close kill or a combo milestone. An
+// arc leaps to the nearest live ember in range and stings it for a small
+// amount; arcs never chain, so one kill can never cascade.
+// Lightning arcs are visual-only: the balance simulation showed 1 damage
+// per arc doubling the casual pilot's win rate (35% -> 70% over 20
+// seeds), while 0 damage held every pilot's rate at the baseline.
+// The world still accepts an arcDamage option for future tuning; the
+// shipped default stays 0 unless a later sim says otherwise.
+export const ARC_DAMAGE = 0;
+export const ARC_RANGE = 260;
+export const ARC_LIFE = 0.18;
+
+// Local records: the best score and the earned badges live in the
+// player's own browser, nowhere else.
+export const BADGE_KEY = 'emberfall-arena-badges';
+
 // Ember night: warm fire on a deep blue field, with frost and spark as
 // the two accent voices. Text pairs are checked against WCAG AA.
 export const PALETTE = {

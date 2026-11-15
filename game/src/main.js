@@ -10,11 +10,12 @@
 // a kill is felt, not just seen. The freeze is render-loop only — the
 // staged screenshot path never sees it.
 //
-// ?seed=N fixes the arena's random pattern. ?shot=start|play|combo|win|end
+// ?seed=N fixes the arena's random pattern. ?shot=start|play|combo|win|end|arc
 // (with &seed=N) stages that scene instead of running the loop, paints it
 // twice and sets window.__shotReady for a screenshot.
 
 import { BEST_KEY, BUTTONS, HIT_STOP_KILL, STEP } from './config.js';
+import { evaluateBadges, loadBadges, saveBadges } from './challenges.js';
 import { createRandom } from './random.js';
 import {
   EVENT_HIT, EVENT_KILL, EVENT_OVER, EVENT_PICKUP, EVENT_SHIELD_BLOCK,
@@ -55,7 +56,12 @@ function saveBest(value) {
 }
 
 // A handle for automated play-testing: the live state and screen, read-only.
-window.__emberfall = { state: world.state, get screen() { return currentScreen; } };
+let earnedBadges = loadBadges();
+window.__emberfall = {
+  state: world.state,
+  get screen() { return currentScreen; },
+  get badges() { return [...earnedBadges]; },
+};
 let currentScreen = SCREEN_TITLE;
 
 function runShot(name) {
@@ -63,9 +69,20 @@ function runShot(name) {
   // A staged frame must be exactly reproducible: no shake offset.
   world.state.shake = 0;
   currentScreen = scene.screen;
+  // End scenes show the badges the staged run actually earned, exactly
+  // as a player would see them after that run — never an empty row
+  // pretending a wave-10 run earned nothing.
+  const won = scene.screen === SCREEN_WON;
+  const shotBadges = (scene.screen === SCREEN_OVER || won)
+    ? evaluateBadges(world.state, won, [])
+    : [];
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best, sound.isMuted(), null, false);
+    // Staged frames render every entrance at its rested state, so a
+    // screenshot is the finished layout, never mid-slide.
+    renderer.draw(world.state, scene.screen, scene.best, sound.isMuted(), null, false, {
+      instant: true, badges: shotBadges, newBadges: shotBadges,
+    });
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -84,10 +101,15 @@ function runGame() {
     return pointInButton(clientX, clientY, BUTTONS.mute) || pointInButton(clientX, clientY, BUTTONS.pause);
   }
 
-  const input = createInput(canvas, isUiPoint);
+  const input = createInput(canvas, isUiPoint, {
+    toLogical: (clientX, clientY) => renderer.toLogical(clientX, clientY),
+    isPlaying: () => screen === SCREEN_PLAY,
+  });
   let screen = SCREEN_TITLE;
   let best = readBest();
   let newBest = false;
+  let newBadges = [];
+  let screenShownAt = performance.now();
   let accumulator = 0;
   let last = performance.now();
   let hitStopUntil = 0;
@@ -101,6 +123,8 @@ function runGame() {
   function syncScreen(next) {
     screen = next;
     currentScreen = next;
+    // Every screen change restarts its entrance clock.
+    screenShownAt = performance.now();
   }
 
   function toggleMute() {
@@ -122,6 +146,7 @@ function runGame() {
     sound.unlock();
     world.reset();
     newBest = false;
+    newBadges = [];
     accumulator = 0;
     hitStopUntil = 0;
     syncScreen(SCREEN_PLAY);
@@ -130,6 +155,12 @@ function runGame() {
 
   function endGame(won) {
     syncScreen(won ? SCREEN_WON : SCREEN_OVER);
+    // Badges are earned only when the run's measured state says so.
+    newBadges = evaluateBadges(world.state, won, earnedBadges);
+    if (newBadges.length > 0) {
+      earnedBadges = [...earnedBadges, ...newBadges];
+      saveBadges(earnedBadges);
+    }
     newBest = world.state.score > best && world.state.score > 0;
     if (newBest) {
       best = world.state.score;
@@ -232,8 +263,19 @@ function runGame() {
       accumulator = 0;
     }
     const mouse = input.mouse();
-    const mouseLogical = renderer.toLogical(mouse.x, mouse.y);
-    renderer.draw(world.state, screen, best, sound.isMuted(), mouseLogical, newBest);
+    const touch = input.touch();
+    // On a phone the reticle lives at the aiming thumb; with no thumb
+    // down and no mouse ever moved, there is no pointer to show, so the
+    // reticle stays hidden instead of parking in a corner.
+    const showPointer = !touch.detected || touch.aiming || mouse.moved;
+    const mouseLogical = showPointer ? renderer.toLogical(mouse.x, mouse.y) : null;
+    renderer.draw(world.state, screen, best, sound.isMuted(), mouseLogical, newBest, {
+      touch,
+      touchDetected: touch.detected,
+      uiTime: (now - screenShownAt) / 1000,
+      badges: earnedBadges,
+      newBadges,
+    });
   }
 
   // Leaving the tab pauses a running game rather than letting embers fall unseen.

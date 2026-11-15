@@ -7,6 +7,9 @@
 // threats and chases pickups; the idle pilot never fires, so it is caught
 // out and the game ends — as a hurried player is. Telegraphing enemies
 // are ignored until they arrive: the pilot fights what can fight back.
+// The pilots are exported so the balance simulation can steer the same
+// rules with the same hands, and the arc scene freezes the frame the
+// instant a lightning arc is born.
 
 import { COMBO_WINDOW, FIELD, STEP } from './config.js';
 import { EVENT_OVER, EVENT_WON } from './world.js';
@@ -17,9 +20,10 @@ const PLAY_LIMIT_SECONDS = 150;
 const COMBO_LIMIT_SECONDS = 300;
 const WIN_LIMIT_SECONDS = 900;
 const END_LIMIT_SECONDS = 600;
+const ARC_LIMIT_SECONDS = 150;
 
 /** Aim at the nearest live ember and move: flee what is close, close in otherwise. */
-function strongPilot(state) {
+export function strongPilot(state) {
   const player = state.player;
   let nearest = null;
   let nearestDistance = Infinity;
@@ -98,14 +102,14 @@ function strongPilot(state) {
   return { move: { x: moveX / length, y: moveY / length }, aim, firing };
 }
 
-function idlePilot(state) {
+export function idlePilot(state) {
   return { move: { x: Math.sin(state.time * 0.7) * 0.5, y: Math.cos(state.time * 0.5) * 0.5 }, aim: 0, firing: false };
 }
 
 // A fumbler: it fires and roughly aims, but never dodges and its aim
 // wanders, so it scores a real run and still gets caught out — the
 // game-over frame shows a run that actually happened, not an empty one.
-function fumblerPilot(state) {
+export function fumblerPilot(state) {
   const player = state.player;
   let nearest = null;
   let nearestDistance = Infinity;
@@ -127,13 +131,65 @@ function fumblerPilot(state) {
   };
 }
 
+// A casual player: it aims at the nearest ember but its aim wanders, it
+// walks in a slow circle, and it only flinches away when an ember is
+// about to touch it. Strong enough to win sometimes, careless enough
+// to lose most of the time.
+export function casualPilot(state) {
+  const player = state.player;
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const enemy of state.enemies) {
+    if (enemy.spawning > 0) continue;
+    const distance = Math.hypot(enemy.x - player.x, enemy.y - player.y);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = enemy;
+    }
+  }
+  const aim = nearest
+    ? Math.atan2(nearest.y - player.y, nearest.x - player.x) + Math.sin(state.time * 1.1) * 0.35
+    : player.angle;
+  let move = { x: Math.cos(state.time * 0.35) * 0.7, y: Math.sin(state.time * 0.35) * 0.7 };
+  if (nearest && nearestDistance < 110 && nearestDistance > 1) {
+    // A late flinch: away from the ember that is nearly on top of it.
+    move = {
+      x: (player.x - nearest.x) / nearestDistance,
+      y: (player.y - nearest.y) / nearestDistance,
+    };
+  }
+  return { move, aim, firing: state.enemies.length > 0 };
+}
+
+// A camper: it walks to a corner, stays there and fires at the nearest
+// ember. The arena punishes standing still, so it should never win.
+export function camperPilot(state) {
+  const player = state.player;
+  const dx = 60 - player.x;
+  const dy = 60 - player.y;
+  const distance = Math.hypot(dx, dy);
+  const move = distance > 8 ? { x: dx / distance, y: dy / distance } : { x: 0, y: 0 };
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const enemy of state.enemies) {
+    if (enemy.spawning > 0) continue;
+    const d = Math.hypot(enemy.x - player.x, enemy.y - player.y);
+    if (d < nearestDistance) {
+      nearestDistance = d;
+      nearest = enemy;
+    }
+  }
+  const aim = nearest ? Math.atan2(nearest.y - player.y, nearest.x - player.x) : player.angle;
+  return { move, aim, firing: nearest !== null };
+}
+
 /**
- * Set `world` to the named scene (start, play, combo, win or end) and return
+ * Set `world` to the named scene (start, play, combo, win, end or arc) and return
  * the screen to draw over it and the best score to show.
  */
 export function stageShot(name, world) {
   world.reset();
-  if (name !== 'play' && name !== 'combo' && name !== 'win' && name !== 'end') {
+  if (name !== 'play' && name !== 'combo' && name !== 'win' && name !== 'end' && name !== 'arc') {
     for (let index = 0; index < START_SECONDS / STEP; index += 1) {
       world.step(STEP, { x: 0, y: 0 }, false, 0, true);
     }
@@ -156,6 +212,27 @@ export function stageShot(name, world) {
       }
     }
     return { screen: SCREEN_OVER, best: world.state.score };
+  }
+  if (name === 'arc') {
+    for (let index = 0; index < ARC_LIMIT_SECONDS / STEP; index += 1) {
+      const pilot = strongPilot(world.state);
+      const events = world.step(STEP, pilot.move, pilot.firing, pilot.aim);
+      if (events & EVENT_OVER || events & EVENT_WON) break;
+      // Freeze the instant an arc is born: its full life is in the frame.
+      if (world.state.arcs.length > 0) return { screen: SCREEN_PLAY, best: world.state.score };
+    }
+    // No arc fired in the limit: fall back to the play frame, so the
+    // scene still shows a real fight rather than an empty arena.
+    for (let index = 0; index < PLAY_LIMIT_SECONDS / STEP; index += 1) {
+      const pilot = strongPilot(world.state);
+      const events = world.step(STEP, pilot.move, pilot.firing, pilot.aim);
+      if (events & EVENT_OVER || events & EVENT_WON) break;
+      if (world.state.wave >= 3 && world.state.enemies.length >= 7
+        && world.state.combo >= 4 && world.state.comboTimer > COMBO_WINDOW * 0.5) {
+        return { screen: SCREEN_PLAY, best: world.state.score };
+      }
+    }
+    return { screen: SCREEN_PLAY, best: world.state.score };
   }
   const limit = name === 'win' ? WIN_LIMIT_SECONDS : name === 'combo' ? COMBO_LIMIT_SECONDS : PLAY_LIMIT_SECONDS;
   for (let index = 0; index < limit / STEP; index += 1) {

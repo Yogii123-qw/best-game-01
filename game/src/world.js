@@ -13,11 +13,13 @@
 // player sees.
 
 import {
-  CLOSE_MULT, CLOSE_RANGE, COMBO_WINDOW, DROP_CHANCE, ENEMY_BULLET_RADIUS,
-  ENEMY_BULLET_SPEED, ENEMY_KINDS, FIELD, MAX_LIVES, PICKUPS, PLAYER,
-  RECOVERY_SCORE, RECOVERY_WAVES, SPAWN_TELEGRAPH, START_LIVES,
-  TOTAL_WAVES, WAVE_BREAK, comboMultiplier, enemyKindsForWave,
-  spawnInterval, wavePattern, waveSize, waveSpeedScale,
+  ARC_DAMAGE, ARC_LIFE, ARC_RANGE, CLOSE_MULT, CLOSE_RANGE, COMBO_WINDOW,
+  DROP_CHANCE, ENEMY_BULLET_RADIUS, ENEMY_BULLET_SPEED, ENEMY_KINDS, FIELD,
+  MAX_LIVES, PICKUPS, PLAYER, RECOVERY_SCORE, RECOVERY_WAVES,
+  SPAWN_TELEGRAPH, START_LIVES, SURGE_EXTRA_FRACTION, SURGE_MAX_WAVE,
+  SURGE_MIN_WAVE, SURGE_PACE_FACTOR, TOTAL_WAVES, WAVE_BREAK,
+  comboMultiplier, enemyKindsForWave, spawnInterval, wavePattern, waveSize,
+  waveSpeedScale,
 } from './config.js';
 
 export const EVENT_HIT = 1;
@@ -30,8 +32,12 @@ export const EVENT_SHIELD_BLOCK = 64;
 export const EVENT_SHOOT = 128;
 export const EVENT_WAVE_START = 256;
 
-export function createWorld(random) {
+export function createWorld(random, options = {}) {
   const state = freshState();
+  // Balance-test hooks, both on by default: the sim toggles them to
+  // isolate what the surge and the arc damage each do to the win rates.
+  const arcDamage = options.arcDamage ?? ARC_DAMAGE;
+  const surgeEnabled = options.surge ?? true;
 
   function freshState() {
     return {
@@ -47,6 +53,8 @@ export function createWorld(random) {
       pickups: [],
       particles: [],
       floaters: [],
+      ghosts: [],
+      arcs: [],
       stars: [],
       motes: [],
       score: 0,
@@ -54,6 +62,12 @@ export function createWorld(random) {
       comboTimer: 0,
       maxCombo: 0,
       closeKills: 0,
+      hitsTaken: 0,
+      blocksTaken: 0,
+      maxWave: 1,
+      surgeWave: 0,
+      surge: false,
+      spawnPace: 1,
       lives: START_LIVES,
       wave: 1,
       waveTotal: 0,
@@ -73,6 +87,7 @@ export function createWorld(random) {
 
   function makeStars() {
     state.stars = [];
+    const depths = [0.25, 0.5, 1];
     for (let i = 0; i < 110; i += 1) {
       state.stars.push({
         x: random.range(0, FIELD.width),
@@ -80,6 +95,7 @@ export function createWorld(random) {
         size: random.range(0.6, 2.4),
         twinkle: random.range(0, Math.PI * 2),
         speed: random.range(0.4, 1.6),
+        depth: depths[i % depths.length],
       });
     }
   }
@@ -93,6 +109,7 @@ export function createWorld(random) {
         size: random.range(1.2, 2.8),
         rise: random.range(8, 22),
         sway: random.range(0, Math.PI * 2),
+        depth: i % 2 === 0 ? 0.5 : 1,
       });
     }
   }
@@ -115,7 +132,7 @@ export function createWorld(random) {
 
   function floater(x, y, text, colour) {
     if (state.floaters.length >= 12) state.floaters.shift();
-    state.floaters.push({ x, y, text, colour, life: 0.9, maxLife: 0.9 });
+    state.floaters.push({ x, y, text, colour, life: 0.9, maxLife: 0.9, age: 0 });
   }
 
   function edgeSpawnPoint() {
@@ -138,7 +155,10 @@ export function createWorld(random) {
   function startWave(wave) {
     const kinds = enemyKindsForWave(wave);
     const queue = [];
-    const total = waveSize(wave);
+    const surge = surgeEnabled && wave === state.surgeWave;
+    const total = surge
+      ? waveSize(wave) + Math.ceil(waveSize(wave) * SURGE_EXTRA_FRACTION)
+      : waveSize(wave);
     for (let i = 0; i < total; i += 1) {
       if (kinds.includes('shooter') && i % 4 === 3) queue.push('shooter');
       else if (kinds.includes('rusher') && i % 3 === 2) queue.push('rusher');
@@ -152,17 +172,22 @@ export function createWorld(random) {
     state.spawnQueue = queue;
     state.spawnPattern = wavePattern(wave);
     state.spawnTimer = wave === 1 ? 0.6 : 0.4;
+    state.spawnPace = surge ? SURGE_PACE_FACTOR : 1;
+    state.surge = surge;
     state.waveTotal = total;
     state.waveKills = 0;
     state.phase = 'fight';
+    if (wave > state.maxWave) state.maxWave = wave;
     const sub = wave === TOTAL_WAVES
       ? 'The final wave — hold the line!'
       : wave === 1
         ? 'Drifters only. Learn to aim, then to run.'
-        : state.spawnPattern === 'ring'
-          ? 'They close in from every side!'
-          : `${total} embers approach`;
-    state.banner = { text: `WAVE ${wave}`, sub, timer: 2.2, duration: 2.2 };
+        : surge
+          ? 'A surge! More embers, faster — hold the line!'
+          : state.spawnPattern === 'ring'
+            ? 'They close in from every side!'
+            : `${total} embers approach`;
+    state.banner = { text: surge ? `SURGE WAVE ${wave}` : `WAVE ${wave}`, sub, timer: 2.2, duration: 2.2 };
   }
 
   function spawnEnemy(kind) {
@@ -191,12 +216,61 @@ export function createWorld(random) {
     state.pickups.push({ kind, x: enemy.x, y: enemy.y, life: PICKUPS[kind].life, bob: random.range(0, Math.PI * 2) });
   }
 
-  function killEnemy(index, events) {
+  // A lightning arc: a jagged polyline from the payoff's source to the
+  // nearest live ember in range. The points are fixed at creation from
+  // the seeded generator, so the bolt is reproducible; the renderer only
+  // fades and flickers it. `chained` kills never spawn arcs, so one kill
+  // can never cascade.
+  function spawnArc(fromX, fromY, kind, events) {
+    let target = null;
+    let targetIndex = -1;
+    let nearest = ARC_RANGE;
+    for (let i = 0; i < state.enemies.length; i += 1) {
+      const enemy = state.enemies[i];
+      if (enemy.spawning > 0) continue;
+      const distance = Math.hypot(enemy.x - fromX, enemy.y - fromY);
+      if (distance < nearest) {
+        nearest = distance;
+        target = enemy;
+        targetIndex = i;
+      }
+    }
+    if (!target) return events;
+    const segments = 6;
+    const points = [{ x: fromX, y: fromY }];
+    const inv = nearest > 1 ? 1 / nearest : 0;
+    const normal = { x: -(target.y - fromY) * inv, y: (target.x - fromX) * inv };
+    for (let i = 1; i < segments; i += 1) {
+      const t = i / segments;
+      const along = { x: fromX + (target.x - fromX) * t, y: fromY + (target.y - fromY) * t };
+      const offset = random.range(-22, 22) * Math.sin(t * Math.PI);
+      points.push({ x: along.x + normal.x * offset, y: along.y + normal.y * offset });
+    }
+    points.push({ x: target.x, y: target.y });
+    state.arcs.push({
+      points,
+      colour: kind === 'close' ? '#ff4fd8' : '#37e6ff',
+      life: ARC_LIFE,
+      maxLife: ARC_LIFE,
+      phase: random.range(0, Math.PI * 2),
+    });
+    if (arcDamage > 0) {
+      target.hp -= arcDamage;
+      target.flash = 0.07;
+      if (target.hp <= 0) return killEnemy(targetIndex, events, true);
+    }
+    return events;
+  }
+
+  function killEnemy(index, events, chained = false) {
     const enemy = state.enemies[index];
     const spec = ENEMY_KINDS[enemy.kind];
     state.enemies.splice(index, 1);
     state.kills += 1;
     state.waveKills += 1;
+    // A dying ember leaves a ghost that swells and fades instead of
+    // popping out of existence.
+    state.ghosts.push({ x: enemy.x, y: enemy.y, kind: enemy.kind, radius: enemy.radius, life: 0.28, maxLife: 0.28 });
     if (state.comboTimer > 0) state.combo += 1;
     else state.combo = 1;
     state.comboTimer = COMBO_WINDOW;
@@ -215,7 +289,16 @@ export function createWorld(random) {
     burst(enemy.x, enemy.y, spec.colour, 16, 260);
     burst(enemy.x, enemy.y, '#ffffff', 5, 160);
     maybeDrop(enemy);
-    return events | EVENT_KILL;
+    events |= EVENT_KILL;
+    if (!chained) {
+      // Lightning pays off the two moments that deserve it: a kill scored
+      // at close range, and every fifth step of a burning combo.
+      if (close) events = spawnArc(enemy.x, enemy.y, 'close', events);
+      else if (state.combo >= 5 && state.combo % 5 === 0) {
+        events = spawnArc(state.player.x, state.player.y, 'combo', events);
+      }
+    }
+    return events;
   }
 
   function hurtPlayer(events) {
@@ -224,6 +307,7 @@ export function createWorld(random) {
     if (player.shield) {
       player.shield = false;
       player.invulnerable = 1.0;
+      state.blocksTaken += 1;
       state.combo = 0;
       state.comboTimer = 0;
       state.shake = 10;
@@ -231,6 +315,7 @@ export function createWorld(random) {
       return events | EVENT_SHIELD_BLOCK;
     }
     state.lives -= 1;
+    state.hitsTaken += 1;
     state.combo = 0;
     state.comboTimer = 0;
     state.shake = 18;
@@ -429,9 +514,19 @@ export function createWorld(random) {
     }
     for (let i = state.floaters.length - 1; i >= 0; i -= 1) {
       const floaterItem = state.floaters[i];
-      floaterItem.y -= 42 * dt;
+      floaterItem.age += dt;
+      // Ease-out rise: quick off the kill, then settling as it fades.
+      floaterItem.y -= (30 + 40 * (floaterItem.life / floaterItem.maxLife)) * dt;
       floaterItem.life -= dt;
       if (floaterItem.life <= 0) state.floaters.splice(i, 1);
+    }
+    for (let i = state.ghosts.length - 1; i >= 0; i -= 1) {
+      state.ghosts[i].life -= dt;
+      if (state.ghosts[i].life <= 0) state.ghosts.splice(i, 1);
+    }
+    for (let i = state.arcs.length - 1; i >= 0; i -= 1) {
+      state.arcs[i].life -= dt;
+      if (state.arcs[i].life <= 0) state.arcs.splice(i, 1);
     }
     for (const star of state.stars) star.twinkle += dt * star.speed;
     for (const mote of state.motes) {
@@ -458,6 +553,11 @@ export function createWorld(random) {
       Object.assign(state, freshState());
       makeStars();
       makeMotes();
+      // The surge wave is drawn once per run from the run's own seed, so
+      // every run has a different surprise and the same seed replays it.
+      state.surgeWave = surgeEnabled
+        ? SURGE_MIN_WAVE + Math.floor(random.next() * (SURGE_MAX_WAVE - SURGE_MIN_WAVE + 1))
+        : 0;
       startWave(1);
     },
     // Advance only the ambient layer (see ambient). Used on end screens.
@@ -539,7 +639,7 @@ export function createWorld(random) {
       if (state.spawnQueue.length > 0) {
         state.spawnTimer -= dt;
         if (state.spawnTimer <= 0) {
-          state.spawnTimer = spawnInterval(state.wave);
+          state.spawnTimer = spawnInterval(state.wave) * state.spawnPace;
           spawnEnemy(state.spawnQueue.shift());
         }
       }
