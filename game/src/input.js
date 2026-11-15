@@ -2,7 +2,12 @@
 //
 // Movement keys are read as a held set every frame; single-press actions
 // (start, pause, restart, mute) are queued as one-shot bits the loop takes
-// and clears, so holding a key never fires the action twice.
+// and clears, so holding a key never fires the action twice. Clicks that
+// land on a HUD button (the loop supplies the test) never fire the weapon:
+// pressing pause must not shoot.
+//
+// Losing the window clears everything held, so the wisp never keeps
+// walking after the player alt-tabs away mid-press.
 
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
@@ -16,10 +21,12 @@ const MOVE_KEYS = {
   KeyD: 'right', ArrowRight: 'right',
 };
 
-export function createInput(canvas) {
+export function createInput(canvas, isUiPoint = null) {
   const held = new Set();
   let queued = 0;
   let mouse = { x: 0, y: 0, firing: false, clicked: false };
+  let lastClick = null;
+  let pressWasUi = false;
 
   function onKeyDown(event) {
     const move = MOVE_KEYS[event.code];
@@ -45,6 +52,11 @@ export function createInput(canvas) {
     if (move) held.delete(move);
   }
 
+  function onBlur() {
+    held.clear();
+    mouse = { ...mouse, firing: false, clicked: false };
+  }
+
   function trackMouse(event) {
     const rect = canvas.getBoundingClientRect();
     mouse = { ...mouse, x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -52,7 +64,8 @@ export function createInput(canvas) {
 
   function onMouseDown(event) {
     trackMouse(event);
-    mouse = { ...mouse, firing: true };
+    pressWasUi = Boolean(isUiPoint && isUiPoint(event.clientX, event.clientY));
+    if (!pressWasUi) mouse = { ...mouse, firing: true };
   }
 
   function onMouseUp() {
@@ -61,11 +74,14 @@ export function createInput(canvas) {
 
   function onClick(event) {
     trackMouse(event);
-    mouse = { ...mouse, clicked: true };
+    lastClick = { x: event.clientX, y: event.clientY, ui: pressWasUi };
+    if (!pressWasUi) mouse = { ...mouse, clicked: true };
+    pressWasUi = false;
   }
 
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
+  window.addEventListener('blur', onBlur);
   canvas.addEventListener('mousemove', trackMouse);
   canvas.addEventListener('mousedown', onMouseDown);
   window.addEventListener('mouseup', onMouseUp);
@@ -93,6 +109,13 @@ export function createInput(canvas) {
       const clicked = mouse.clicked;
       mouse = { ...mouse, clicked: false };
       return clicked;
+    },
+    // The most recent click in client coordinates (for HUD button hits),
+    // consumed on read.
+    takeClickPoint() {
+      const point = lastClick;
+      lastClick = null;
+      return point;
     },
   };
 }

@@ -3,15 +3,23 @@
 // Input is read every frame, the world advances in fixed 1/60 s steps
 // (several in a slow frame, none in a fast one), and the renderer paints
 // what is there. The game moves between five screens: title, play, paused,
-// victory and game over.
+// victory and game over. End screens keep their ambient layer moving
+// (particles, embers, banners) while the rules stay frozen.
+//
+// Kills freeze the simulation for a few frames (hit-stop): the weight of
+// a kill is felt, not just seen. The freeze is render-loop only — the
+// staged screenshot path never sees it.
 //
 // ?seed=N fixes the arena's random pattern. ?shot=start|play|combo|win|end
 // (with &seed=N) stages that scene instead of running the loop, paints it
 // twice and sets window.__shotReady for a screenshot.
 
-import { BEST_KEY, STEP } from './config.js';
+import { BEST_KEY, BUTTONS, HIT_STOP_KILL, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_KILL, EVENT_OVER, EVENT_PICKUP, EVENT_SHIELD_BLOCK, EVENT_WAVE_CLEAR, EVENT_WON } from './world.js';
+import {
+  EVENT_HIT, EVENT_KILL, EVENT_OVER, EVENT_PICKUP, EVENT_SHIELD_BLOCK,
+  EVENT_SHOOT, EVENT_WAVE_CLEAR, EVENT_WAVE_START, EVENT_WON, createWorld,
+} from './world.js';
 import { ACTION_CONFIRM, ACTION_MUTE, ACTION_PAUSE, ACTION_RESTART, createInput } from './input.js';
 import { createSound } from './audio.js';
 import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WON } from './render.js';
@@ -52,10 +60,12 @@ let currentScreen = SCREEN_TITLE;
 
 function runShot(name) {
   const scene = stageShot(name, world);
+  // A staged frame must be exactly reproducible: no shake offset.
+  world.state.shake = 0;
   currentScreen = scene.screen;
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best, sound.isMuted());
+    renderer.draw(world.state, scene.screen, scene.best, sound.isMuted(), null, false);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -64,11 +74,24 @@ function runShot(name) {
 }
 
 function runGame() {
-  const input = createInput(canvas);
+  function pointInButton(clientX, clientY, button) {
+    const point = renderer.toLogical(clientX, clientY);
+    return point.x >= button.x && point.x <= button.x + button.size
+      && point.y >= button.y && point.y <= button.y + button.size;
+  }
+
+  function isUiPoint(clientX, clientY) {
+    return pointInButton(clientX, clientY, BUTTONS.mute) || pointInButton(clientX, clientY, BUTTONS.pause);
+  }
+
+  const input = createInput(canvas, isUiPoint);
   let screen = SCREEN_TITLE;
   let best = readBest();
+  let newBest = false;
   let accumulator = 0;
   let last = performance.now();
+  let hitStopUntil = 0;
+  let lastShootSound = 0;
 
   // Screen readers (and anyone watching the page's text) hear the changes.
   function announce(message) {
@@ -80,31 +103,48 @@ function runGame() {
     currentScreen = next;
   }
 
+  function toggleMute() {
+    const muted = sound.toggleMute();
+    announce(muted ? 'Sound off.' : 'Sound on.');
+  }
+
+  function togglePause() {
+    if (screen === SCREEN_PLAY) {
+      syncScreen(SCREEN_PAUSED);
+      announce('Paused.');
+    } else if (screen === SCREEN_PAUSED) {
+      syncScreen(SCREEN_PLAY);
+      announce('Playing.');
+    }
+  }
+
   function startGame() {
     sound.unlock();
     world.reset();
+    newBest = false;
     accumulator = 0;
+    hitStopUntil = 0;
     syncScreen(SCREEN_PLAY);
     announce('Playing. Three hearts. Survive ten waves.');
   }
 
   function endGame(won) {
     syncScreen(won ? SCREEN_WON : SCREEN_OVER);
-    if (world.state.score > best) {
+    newBest = world.state.score > best && world.state.score > 0;
+    if (newBest) {
       best = world.state.score;
       saveBest(best);
     }
     if (won) sound.win();
     else sound.lose();
-    announce(won ? `Victory! Score ${world.state.score}. Best ${best}.` : `Game over. Score ${world.state.score}. Best ${best}.`);
+    announce(won
+      ? `Victory! Score ${world.state.score}. Best ${best}.`
+      : `Game over. Score ${world.state.score}. Best ${best}.`);
   }
 
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_MUTE) {
-      const muted = sound.toggleMute();
-      announce(muted ? 'Sound off.' : 'Sound on.');
-    }
+    if (actions & ACTION_MUTE) toggleMute();
     if (actions & ACTION_RESTART && screen !== SCREEN_TITLE) {
       startGame();
       return;
@@ -114,13 +154,18 @@ function runGame() {
       else if (screen === SCREEN_PAUSED) syncScreen(SCREEN_PLAY);
       return;
     }
-    if (actions & ACTION_PAUSE) {
-      if (screen === SCREEN_PLAY) {
-        syncScreen(SCREEN_PAUSED);
-        announce('Paused.');
-      } else if (screen === SCREEN_PAUSED) {
-        syncScreen(SCREEN_PLAY);
-        announce('Playing.');
+    if (actions & ACTION_PAUSE) togglePause();
+    // HUD buttons first: a click on one must never start the game or fire.
+    const clickPoint = input.takeClickPoint();
+    if (clickPoint) {
+      if (pointInButton(clickPoint.x, clickPoint.y, BUTTONS.mute)) {
+        toggleMute();
+        return;
+      }
+      if ((screen === SCREEN_PLAY || screen === SCREEN_PAUSED)
+        && pointInButton(clickPoint.x, clickPoint.y, BUTTONS.pause)) {
+        togglePause();
+        return;
       }
     }
     if (input.takeClick()) {
@@ -130,12 +175,20 @@ function runGame() {
     }
   }
 
-  function playEvents(events) {
-    if (events & EVENT_KILL) sound.kill();
+  function playEvents(events, now) {
+    if (events & EVENT_KILL) {
+      sound.kill();
+      hitStopUntil = now + HIT_STOP_KILL * 1000;
+    }
+    if (events & EVENT_SHOOT && now - lastShootSound > 90) {
+      lastShootSound = now;
+      sound.shoot();
+    }
     if (events & EVENT_HIT) sound.hurt();
     if (events & EVENT_SHIELD_BLOCK) sound.hit();
     if (events & EVENT_PICKUP) sound.pickup();
     if (events & EVENT_WAVE_CLEAR) sound.waveClear();
+    if (events & EVENT_WAVE_START) sound.waveStart();
   }
 
   function step() {
@@ -147,7 +200,7 @@ function runGame() {
     const aimPoint = renderer.toLogical(mouse.x, mouse.y);
     const aim = Math.atan2(aimPoint.y - world.state.player.y, aimPoint.x - world.state.player.x);
     const events = world.step(STEP, input.direction(), mouse.firing, aim);
-    playEvents(events);
+    playEvents(events, performance.now());
     if (events & EVENT_WON) endGame(true);
     else if (events & EVENT_OVER) endGame(false);
     else if (events & EVENT_HIT) {
@@ -157,18 +210,30 @@ function runGame() {
 
   function frame(now) {
     requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+    const elapsed = Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
     handleActions();
     if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
+      if (now < hitStopUntil) {
+        accumulator = 0;
+      } else {
+        accumulator += elapsed;
+        while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
+          step();
+          accumulator -= STEP;
+        }
       }
+    } else if (screen === SCREEN_OVER || screen === SCREEN_WON) {
+      // End screens stay alive: particles drift, the banner fades, the
+      // prompt pulses. The rules themselves do not advance.
+      accumulator = 0;
+      world.tick(elapsed);
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best, sound.isMuted());
+    const mouse = input.mouse();
+    const mouseLogical = renderer.toLogical(mouse.x, mouse.y);
+    renderer.draw(world.state, screen, best, sound.isMuted(), mouseLogical, newBest);
   }
 
   // Leaving the tab pauses a running game rather than letting embers fall unseen.

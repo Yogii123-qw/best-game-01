@@ -4,20 +4,45 @@
 // game means editing this file and nowhere else. The arena is a fixed
 // logical field (1280 by 720) that the renderer scales to the window, so
 // positions, speeds and hit radii never depend on the screen size.
+//
+// Balance targets (measured with bot pilots over 20 seeds, see NOTES):
+// a skilled player should win most runs in about three minutes, a casual
+// player should reach the middle waves and sometimes win, and a player
+// who never acts should always lose quickly.
 
 export const FIELD = { width: 1280, height: 720 };
 export const STEP = 1 / 60;
 export const TOTAL_WAVES = 10;
 export const START_LIVES = 3;
+export const MAX_LIVES = 5;
 export const BEST_KEY = 'emberfall-arena-best';
-export const COMBO_WINDOW = 3.0;
+export const COMBO_WINDOW = 2.2;
 export const WAVE_BREAK = 2.5;
 
-// Neon embers on a starlit night: orange fire, cyan frost and magenta sparks.
+// A spawning enemy shows a warning ring for this long before it can move
+// or be hit: every arrival is telegraphed, never a surprise.
+export const SPAWN_TELEGRAPH = 0.6;
+// Kills scored close to the wisp pay extra: risk is rewarded, and the
+// bonus is discovered through play, never explained up front.
+export const CLOSE_RANGE = 200;
+export const CLOSE_MULT = 1.5;
+// Clearing one of these waves while hurt restores one heart; at full
+// starting health it pays score instead, so recovery never dulls tension.
+export const RECOVERY_WAVES = [3, 6, 9];
+export const RECOVERY_SCORE = 500;
+// Hit-stop on a kill only, kept short: weight without sluggishness.
+export const HIT_STOP_KILL = 0.045;
+
+// Ember night: warm fire on a deep blue field, with frost and spark as
+// the two accent voices. Text pairs are checked against WCAG AA.
 export const PALETTE = {
   background: '#070a18',
-  backgroundGlow: '#0d1230',
+  backgroundGlow: '#101737',
+  floorRing: 'rgba(120, 150, 255, 0.07)',
+  floorDot: 'rgba(160, 180, 255, 0.10)',
+  arenaEdge: 'rgba(120, 150, 255, 0.28)',
   star: '#cdd8ff',
+  mote: '#ff9a2a',
   ember: '#ff9a2a',
   emberCore: '#ffd166',
   flame: '#ff5d3a',
@@ -27,9 +52,12 @@ export const PALETTE = {
   leaf: '#7dff8a',
   gold: '#ffe066',
   text: '#f4f7ff',
-  dimText: '#9aa8d8',
-  panel: 'rgba(10, 14, 34, 0.82)',
-  panelEdge: 'rgba(120, 150, 255, 0.35)',
+  dimText: '#aab6e2',
+  panel: 'rgba(10, 14, 34, 0.88)',
+  panelEdge: 'rgba(120, 150, 255, 0.40)',
+  scrim: 'rgba(4, 6, 16, 0.55)',
+  buttonFace: '#ffd166',
+  buttonText: '#231303',
 };
 
 export const PLAYER = {
@@ -39,15 +67,21 @@ export const PLAYER = {
   bulletSpeed: 720,
   bulletRadius: 5,
   bulletDamage: 1,
-  invulnerableSeconds: 1.6,
+  invulnerableSeconds: 2.3,
 };
 
-// kind -> shape, colour, movement and reward. Shooters only join late waves.
+// kind -> shape, colour, movement and reward. Rushers join from wave 2,
+// shooters from wave 3, so wave 1 teaches aim and fire with drifters only.
 export const ENEMY_KINDS = {
   drifter: { radius: 20, speed: 62, hp: 2, score: 100, colour: PALETTE.ember, ring: PALETTE.flame },
-  rusher: { radius: 15, speed: 150, hp: 1, score: 150, colour: PALETTE.spark, ring: PALETTE.danger },
+  rusher: { radius: 15, speed: 160, hp: 1, score: 150, colour: PALETTE.spark, ring: PALETTE.danger },
   shooter: { radius: 18, speed: 95, hp: 3, score: 250, colour: PALETTE.frost, ring: '#b8f6ff' },
 };
+
+// Enemy bullets are faster than the player: running away in a straight
+// line is not a free answer to shooters.
+export const ENEMY_BULLET_SPEED = 340;
+export const ENEMY_BULLET_RADIUS = 6;
 
 export const PICKUPS = {
   heart: { radius: 14, colour: PALETTE.danger, life: 9 },
@@ -55,21 +89,43 @@ export const PICKUPS = {
   shield: { radius: 14, colour: PALETTE.frost, life: 9 },
 };
 
-// Drop chances on an enemy kill: a heart is rare, a shard is common.
-export const DROP_CHANCE = { heart: 0.04, shard: 0.16, shield: 0.07 };
+// Drop chances on an enemy kill: a heart is uncommon, a shard is common.
+export const DROP_CHANCE = { heart: 0.06, shard: 0.16, shield: 0.07 };
+
+// Clickable HUD buttons, in logical coordinates, bottom right.
+export const BUTTONS = {
+  mute: { x: 1136, y: 644, size: 52 },
+  pause: { x: 1196, y: 644, size: 52 },
+};
 
 export function waveSize(wave) {
   return 4 + wave * 2;
 }
 
+// Early waves spawn slowly so a first-time player can breathe; the pace
+// tightens as the run goes on.
+export function spawnInterval(wave) {
+  if (wave === 1) return 0.85;
+  if (wave === 2) return 0.7;
+  if (wave >= TOTAL_WAVES) return 0.42;
+  return 0.55;
+}
+
 export function waveSpeedScale(wave) {
-  return 1 + (wave - 1) * 0.07;
+  return 1 + (wave - 1) * 0.04;
 }
 
 export function enemyKindsForWave(wave) {
+  if (wave < 2) return ['drifter'];
   const kinds = ['drifter', 'rusher'];
   if (wave >= 3) kinds.push('shooter');
   return kinds;
+}
+
+// Every third wave arrives as a ring closing in, so the middle of a run
+// never feels like the same trickle twice.
+export function wavePattern(wave) {
+  return wave % 3 === 0 ? 'ring' : 'edge';
 }
 
 export function comboMultiplier(combo) {
